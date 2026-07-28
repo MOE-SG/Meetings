@@ -7,6 +7,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Meeting Scope">
+<link rel="manifest" href="./manifest.json">
+<link rel="icon" href="./icon-192.png">
+<link rel="apple-touch-icon" href="./icon-192.png">
 <title>Meeting Scope — local transcription</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
@@ -363,58 +366,6 @@ setupStoragePersistence();
 // service worker (optional — only if hosted over http/https),
 // and install / uninstall UI
 // ---------------------------------------------------------------
-function generateIcon(size){
-  const c = document.createElement('canvas');
-  c.width = size; c.height = size;
-  const cx = c.getContext('2d');
-  cx.fillStyle = '#0a0f0d';
-  cx.fillRect(0, 0, size, size);
-  cx.strokeStyle = '#223029';
-  cx.lineWidth = size * 0.03;
-  cx.strokeRect(size * 0.04, size * 0.04, size * 0.92, size * 0.92);
-  cx.strokeStyle = '#7cffb2';
-  cx.lineWidth = size * 0.05;
-  cx.shadowColor = '#7cffb2';
-  cx.shadowBlur = size * 0.06;
-  cx.beginPath();
-  const midY = size * 0.56;
-  for (let x = 0; x <= size; x += size / 48) {
-    const y = midY + Math.sin((x / size) * Math.PI * 3) * size * 0.16 * Math.sin((x / size) * Math.PI);
-    if (x === 0) cx.moveTo(x, y); else cx.lineTo(x, y);
-  }
-  cx.stroke();
-  cx.shadowBlur = 0;
-  cx.fillStyle = '#ff6b5e';
-  cx.beginPath();
-  cx.arc(size * 0.83, size * 0.2, size * 0.055, 0, Math.PI * 2);
-  cx.fill();
-  return c.toDataURL('image/png');
-}
-
-function setupManifest(){
-  const manifest = {
-    name: 'Meeting Scope — local transcription',
-    short_name: 'Meeting Scope',
-    description: 'Fully in-browser meeting transcription, nothing leaves the device.',
-    start_url: '.',
-    scope: '.',
-    display: 'standalone',
-    background_color: '#0a0f0d',
-    theme_color: '#0a0f0d',
-    icons: [
-      { src: generateIcon(192), sizes: '192x192', type: 'image/png', purpose: 'any' },
-      { src: generateIcon(512), sizes: '512x512', type: 'image/png', purpose: 'any' },
-      { src: generateIcon(512), sizes: '512x512', type: 'image/png', purpose: 'maskable' }
-    ]
-  };
-  const url = URL.createObjectURL(new Blob([JSON.stringify(manifest)], { type: 'application/manifest+json' }));
-  const link = document.createElement('link');
-  link.rel = 'manifest';
-  link.href = url;
-  document.head.appendChild(link);
-}
-setupManifest();
-
 // Registering from a blob: URL isn't allowed for service workers, so this
 // only activates when the file is actually hosted (e.g. GitHub Pages) next
 // to a real sw.js. On file:// or without sw.js present it just no-ops —

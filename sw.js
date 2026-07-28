@@ -5,8 +5,8 @@
 // This just lets the app shell (index.html itself) load instantly and
 // work offline after the first visit.
 
-const CACHE_NAME = 'meeting-scope-shell-v1';
-const SHELL_FILES = ['./', './index.html'];
+const CACHE_NAME = 'meeting-scope-shell-v2';
+const SHELL_FILES = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
