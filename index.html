@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#0a0f0d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Meeting Scope">
 <title>Meeting Scope — local transcription</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
@@ -209,6 +212,18 @@
   <div class="grid">
     <div class="rail">
 
+      <div class="rail-group" id="pwaGroup">
+        <h3>Web app</h3>
+        <button class="btn primary" id="btnInstall" style="display:none;">⤓ Save as web app</button>
+        <div id="pwaInstalledBox" style="display:none;">
+          <div class="meta-line"><span>Status</span><b style="color:var(--phosphor);">Installed</b></div>
+          <button class="btn stop" id="btnUninstallHelp" style="margin-top:6px;">✕ Uninstall</button>
+        </div>
+        <div class="meta-line" id="pwaFallback" style="display:none;border:none;color:var(--text-dim);font-size:10.5px;line-height:1.6;padding-top:2px;">
+          No install prompt available in this browser — check the address bar for an install icon, or use the browser menu → "Install app".
+        </div>
+      </div>
+
       <div class="rail-group">
         <h3>Capture source</h3>
         <button class="btn primary" id="btnTab">▶ Capture tab audio</button>
@@ -232,6 +247,8 @@
         <div class="meta-line"><span>Backend</span><b id="metaBackend">—</b></div>
         <div class="meta-line"><span>Status</span><b id="metaStatus">not loaded</b></div>
         <div class="progress-track"><div class="progress-fill" id="modelProgress"></div></div>
+        <div class="meta-line" style="margin-top:8px;"><span>Cached on disk</span><b id="metaCache">—</b></div>
+        <div class="meta-line"><span>Storage persisted</span><b id="metaPersist">—</b></div>
       </div>
 
       <div class="rail-group">
@@ -301,9 +318,164 @@ const scopeTime = el('scopeTime');
 const transcriptLog = el('transcriptLog');
 const emptyState = el('emptyState');
 const summaryDrawer = el('summaryDrawer');
+const btnInstall = el('btnInstall'), pwaInstalledBox = el('pwaInstalledBox');
+const pwaFallback = el('pwaFallback'), btnUninstallHelp = el('btnUninstallHelp');
 const btnTab = el('btnTab'), btnMic = el('btnMic'), btnStop = el('btnStop');
 const btnSummarize = el('btnSummarize'), btnExport = el('btnExport'), btnClear = el('btnClear');
 const langSelect = el('langSelect');
+const metaCache = el('metaCache'), metaPersist = el('metaPersist');
+
+// ---------------------------------------------------------------
+// storage: ask the browser not to evict the cached model weights,
+// and show how much is actually sitting in cache right now
+// ---------------------------------------------------------------
+async function setupStoragePersistence(){
+  if (navigator.storage && navigator.storage.persist) {
+    try {
+      const already = await navigator.storage.persisted();
+      const granted = already || await navigator.storage.persist();
+      metaPersist.textContent = granted ? 'yes' : 'not granted';
+    } catch {
+      metaPersist.textContent = 'unsupported';
+    }
+  } else {
+    metaPersist.textContent = 'unsupported';
+  }
+  refreshCacheEstimate();
+}
+
+async function refreshCacheEstimate(){
+  if (navigator.storage && navigator.storage.estimate) {
+    try {
+      const { usage } = await navigator.storage.estimate();
+      metaCache.textContent = usage ? `${(usage / 1e6).toFixed(0)} MB` : '0 MB';
+    } catch {
+      metaCache.textContent = 'n/a';
+    }
+  } else {
+    metaCache.textContent = 'n/a';
+  }
+}
+setupStoragePersistence();
+
+// ---------------------------------------------------------------
+// PWA: manifest (built at runtime, no separate file needed),
+// service worker (optional — only if hosted over http/https),
+// and install / uninstall UI
+// ---------------------------------------------------------------
+function generateIcon(size){
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#0a0f0d';
+  cx.fillRect(0, 0, size, size);
+  cx.strokeStyle = '#223029';
+  cx.lineWidth = size * 0.03;
+  cx.strokeRect(size * 0.04, size * 0.04, size * 0.92, size * 0.92);
+  cx.strokeStyle = '#7cffb2';
+  cx.lineWidth = size * 0.05;
+  cx.shadowColor = '#7cffb2';
+  cx.shadowBlur = size * 0.06;
+  cx.beginPath();
+  const midY = size * 0.56;
+  for (let x = 0; x <= size; x += size / 48) {
+    const y = midY + Math.sin((x / size) * Math.PI * 3) * size * 0.16 * Math.sin((x / size) * Math.PI);
+    if (x === 0) cx.moveTo(x, y); else cx.lineTo(x, y);
+  }
+  cx.stroke();
+  cx.shadowBlur = 0;
+  cx.fillStyle = '#ff6b5e';
+  cx.beginPath();
+  cx.arc(size * 0.83, size * 0.2, size * 0.055, 0, Math.PI * 2);
+  cx.fill();
+  return c.toDataURL('image/png');
+}
+
+function setupManifest(){
+  const manifest = {
+    name: 'Meeting Scope — local transcription',
+    short_name: 'Meeting Scope',
+    description: 'Fully in-browser meeting transcription, nothing leaves the device.',
+    start_url: '.',
+    scope: '.',
+    display: 'standalone',
+    background_color: '#0a0f0d',
+    theme_color: '#0a0f0d',
+    icons: [
+      { src: generateIcon(192), sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: generateIcon(512), sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: generateIcon(512), sizes: '512x512', type: 'image/png', purpose: 'maskable' }
+    ]
+  };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(manifest)], { type: 'application/manifest+json' }));
+  const link = document.createElement('link');
+  link.rel = 'manifest';
+  link.href = url;
+  document.head.appendChild(link);
+}
+setupManifest();
+
+// Registering from a blob: URL isn't allowed for service workers, so this
+// only activates when the file is actually hosted (e.g. GitHub Pages) next
+// to a real sw.js. On file:// or without sw.js present it just no-ops —
+// install still works without it on current Chrome/Edge.
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  navigator.serviceWorker.register('./sw.js').catch(() => { /* no sw.js alongside this file — fine */ });
+}
+
+let deferredInstallPrompt = null;
+
+function isStandalone(){
+  return window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+}
+
+function refreshPwaUI(){
+  if (isStandalone()) {
+    btnInstall.style.display = 'none';
+    pwaFallback.style.display = 'none';
+    pwaInstalledBox.style.display = 'block';
+  } else if (deferredInstallPrompt) {
+    btnInstall.style.display = 'flex';
+    pwaInstalledBox.style.display = 'none';
+    pwaFallback.style.display = 'none';
+  } else {
+    btnInstall.style.display = 'none';
+    pwaInstalledBox.style.display = 'none';
+    pwaFallback.style.display = 'block';
+  }
+}
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  refreshPwaUI();
+});
+
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  refreshPwaUI();
+});
+
+btnInstall.addEventListener('click', async () => {
+  if (!deferredInstallPrompt) return;
+  deferredInstallPrompt.prompt();
+  await deferredInstallPrompt.userChoice;
+  deferredInstallPrompt = null;
+  refreshPwaUI();
+});
+
+btnUninstallHelp.addEventListener('click', () => {
+  // No web API lets a page remove its own installed app — browsers
+  // deliberately keep uninstall as a user-initiated OS/browser action.
+  alert(
+    "Browsers don't let a page uninstall itself. To remove Meeting Scope:\n\n" +
+    "• Chrome/Edge desktop: open the ⋮ menu in this app's window → \"Uninstall Meeting Scope…\"\n" +
+    "• Or right-click its icon in your taskbar / dock / app launcher → Uninstall / Remove\n" +
+    "• Android/iOS: long-press the home screen icon → Remove / Uninstall"
+  );
+});
+
+refreshPwaUI();
 
 // ---------------------------------------------------------------
 // worker (whisper inference lives here so the UI stays smooth)
@@ -367,6 +539,7 @@ function onModelReady(){
   lblModel.textContent = 'Model: ready';
   btnTab.disabled = false;
   btnMic.disabled = false;
+  refreshCacheEstimate();
 }
 function onWorkerError(msg){
   console.error('worker error:', msg);
