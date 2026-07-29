@@ -201,6 +201,8 @@
     font-size:13px;line-height:1.65;max-height:520px;
   }
   .transcript-row{display:flex;gap:12px;margin-bottom:10px;}
+  .paragraph{margin-bottom:6px;padding-top:12px;border-top:1px dashed var(--line-soft);}
+  .paragraph:first-child{border-top:none;padding-top:0;}
   .ts{color:var(--phosphor-dim);flex-shrink:0;user-select:none;}
   .txt{color:var(--text);}
   .empty-state{
@@ -307,7 +309,10 @@
 
     <div class="transcript-panel">
       <div class="transcript-head">
-        <h3>Transcript log</h3>
+        <div>
+          <h3 style="margin-bottom:3px;">Transcript log</h3>
+          <span style="font-family:var(--mono);font-size:9.5px;color:var(--text-dim);letter-spacing:.03em;">breaks = long pause, not verified speaker ID</span>
+        </div>
         <button class="icon-btn" id="btnClear">clear</button>
       </div>
       <div class="transcript-log" id="transcriptLog">
@@ -315,7 +320,7 @@
           Nothing captured yet.<br><br>
           <b>1.</b> Choose a capture source — tab audio grabs the meeting playing in another browser tab (you'll pick it from the share prompt), microphone works for in-room speech.<br><br>
           <b>2.</b> The model downloads once, then everything runs offline, on-device.<br><br>
-          <b>3.</b> Speech is transcribed in rolling ~12s windows as it comes in.
+          <b>3.</b> Speech is transcribed in short bursts as natural pauses happen (or every ~10s during a long uninterrupted stretch).
         </div>
       </div>
       <div class="summary-drawer hidden" id="summaryDrawer"></div>
@@ -346,10 +351,23 @@ let bufferedSamples = 0;
 let bufferSampleRate = 48000;
 let sessionSamples = 0;
 let chunkStartSample = 0;
-const CHUNK_SECONDS = 12;
+let hadSpeechInChunk = false;
+let silenceStartTs = null;
 
-const pendingChunks = new Map(); // id -> timestamp label
-const transcriptRows = [];       // {ts, text}
+// Voice-activity chunking: cut and transcribe on a real pause, so text
+// lands close to natural speech boundaries. If someone talks for a long
+// stretch with no pause, fall back to a max-length cut so text still
+// streams in. Thresholds are tuned for typical laptop-mic/tab-audio
+// levels; SILENCE_RMS_THRESHOLD may need adjusting for very quiet rooms.
+const SILENCE_RMS_THRESHOLD = 0.012;   // energy level treated as "quiet"
+const SILENCE_HOLD_MS = 650;           // quiet duration that counts as a pause
+const PARAGRAPH_BREAK_MS = 1400;       // longer pause -> likely a turn change, start new paragraph
+const MIN_CHUNK_SECONDS = 1.0;         // don't flush slivers shorter than this
+const MAX_CHUNK_SECONDS = 10;          // hard cap if no pause ever comes
+
+const pendingChunks = new Map(); // id -> { ts, newParagraph }
+const transcriptRows = [];       // {ts, text, newParagraph}
+let currentParagraphEl = null;
 
 // ---------------------------------------------------------------
 // DOM refs
@@ -486,8 +504,8 @@ btnUninstallHelp.addEventListener('click', () => {
   // No web API lets a page remove its own installed app — browsers
   // deliberately keep uninstall as a user-initiated OS/browser action.
   alert(
-    "Browsers don't let a page uninstall itself. To remove Meeting Scope:\n\n" +
-    "• Chrome/Edge desktop: open the ⋮ menu in this app's window → \"Uninstall Meeting Scope…\"\n" +
+    "Browsers don't let a page uninstall itself. To remove SOE Meetings:\n\n" +
+    "• Chrome/Edge desktop: open the ⋮ menu in this app's window → \"Uninstall SOE Meetings…\"\n" +
     "• Or right-click its icon in your taskbar / dock / app launcher → Uninstall / Remove\n" +
     "• Android/iOS: long-press the home screen icon → Remove / Uninstall"
   );
@@ -643,7 +661,26 @@ async function startCapture(kind){
 
   processor.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0);
+    const rms = computeRMS(input);
     pushToBuffer(input, audioCtx.sampleRate);
+    if (rms >= SILENCE_RMS_THRESHOLD) hadSpeechInChunk = true;
+
+    const now = performance.now();
+    if (rms < SILENCE_RMS_THRESHOLD) {
+      if (silenceStartTs === null) silenceStartTs = now;
+    } else {
+      silenceStartTs = null;
+    }
+
+    const bufferedSeconds = bufferedSamples / audioCtx.sampleRate;
+    const silenceMs = silenceStartTs !== null ? (now - silenceStartTs) : 0;
+    const pauseHit = silenceMs >= SILENCE_HOLD_MS && bufferedSeconds >= MIN_CHUNK_SECONDS;
+    const maxHit = bufferedSeconds >= MAX_CHUNK_SECONDS;
+
+    if (pauseHit || maxHit) {
+      flushBuffer(pauseHit ? 'pause' : 'maxlen', silenceMs);
+      silenceStartTs = null;
+    }
   };
 
   isRecording = true;
@@ -652,6 +689,8 @@ async function startCapture(kind){
   chunkStartSample = 0;
   pcmBuffer = [];
   bufferedSamples = 0;
+  hadSpeechInChunk = false;
+  silenceStartTs = null;
 
   dotRec.className = 'dot rec';
   lblRec.textContent = 'Recording';
@@ -696,7 +735,6 @@ function pushToBuffer(float32Array, sampleRate){
   pcmBuffer.push(new Float32Array(float32Array));
   bufferedSamples += float32Array.length;
   sessionSamples += float32Array.length;
-  if (bufferedSamples / sampleRate >= CHUNK_SECONDS) flushBuffer();
 }
 
 function mergeBuffers(chunks, total){
@@ -721,17 +759,41 @@ function resampleTo16k(float32, inRate){
   return result;
 }
 
-function flushBuffer(){
+function computeRMS(buf){
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+  return Math.sqrt(sum / buf.length);
+}
+
+function flushBuffer(reason = 'manual', pauseMs = 0){
   if (!pcmBuffer.length || bufferedSamples === 0) return;
+
+  if (!hadSpeechInChunk) {
+    // pure silence (e.g. dead air before anyone speaks) — drop it rather
+    // than waste a transcription call, Whisper tends to hallucinate text
+    // on silence-only input anyway
+    pcmBuffer = [];
+    bufferedSamples = 0;
+    hadSpeechInChunk = false;
+    chunkStartSample = sessionSamples;
+    return;
+  }
+
   const merged = mergeBuffers(pcmBuffer, bufferedSamples);
   const startLabel = formatTime(chunkStartSample / bufferSampleRate);
   chunkStartSample = sessionSamples;
   pcmBuffer = [];
   bufferedSamples = 0;
+  hadSpeechInChunk = false;
+
+  // A long pause is a rough proxy for a turn change — not real speaker
+  // identification, just "enough silence that this is probably a new
+  // thought or a new person," used to break the transcript into paragraphs.
+  const newParagraph = reason === 'pause' && pauseMs >= PARAGRAPH_BREAK_MS;
 
   const resampled = resampleTo16k(merged, bufferSampleRate);
   const id = 'c' + Math.random().toString(36).slice(2);
-  pendingChunks.set(id, startLabel);
+  pendingChunks.set(id, { ts: startLabel, newParagraph });
 
   worker.postMessage(
     { type: 'transcribe', payload: { audio: resampled, id, language: langSelect.value } },
@@ -740,20 +802,25 @@ function flushBuffer(){
 }
 
 function onTranscriptResult({ id, text }){
-  const ts = pendingChunks.get(id) || '00:00';
+  const meta = pendingChunks.get(id) || { ts: '00:00', newParagraph: false };
   pendingChunks.delete(id);
   if (!text) return;
-  transcriptRows.push({ ts, text });
-  renderTranscriptRow(ts, text);
+  transcriptRows.push({ ts: meta.ts, text, newParagraph: meta.newParagraph });
+  renderTranscriptRow(meta.ts, text, meta.newParagraph);
 }
 
-function renderTranscriptRow(ts, text){
-  if (emptyState) { emptyState.remove(); }
+function renderTranscriptRow(ts, text, newParagraph){
+  if (emptyState) { emptyState.remove(); emptyState = null; }
+  if (!currentParagraphEl || newParagraph) {
+    currentParagraphEl = document.createElement('div');
+    currentParagraphEl.className = 'paragraph';
+    transcriptLog.appendChild(currentParagraphEl);
+  }
   const row = document.createElement('div');
   row.className = 'transcript-row';
   row.innerHTML = `<span class="ts">${ts}</span><span class="txt"></span>`;
   row.querySelector('.txt').textContent = text;
-  transcriptLog.appendChild(row);
+  currentParagraphEl.appendChild(row);
   transcriptLog.scrollTop = transcriptLog.scrollHeight;
 }
 
@@ -829,7 +896,10 @@ drawScope();
 // export
 // ---------------------------------------------------------------
 function getFullTranscript(){
-  return transcriptRows.map(r => `**[${r.ts}]** ${r.text}`).join('\n\n');
+  return transcriptRows.map((r, i) => {
+    const sep = i === 0 ? '' : (r.newParagraph ? '\n\n' : '\n');
+    return `${sep}**[${r.ts}]** ${r.text}`;
+  }).join('');
 }
 
 btnExport.addEventListener('click', () => {
@@ -846,6 +916,7 @@ btnExport.addEventListener('click', () => {
 btnClear.addEventListener('click', () => {
   transcriptRows.length = 0;
   transcriptLog.innerHTML = '';
+  currentParagraphEl = null;
   summaryDrawer.classList.add('hidden');
   summaryDrawer.textContent = '';
 });
