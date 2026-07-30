@@ -1046,6 +1046,10 @@ function onDiarizationProgress(payload){
   if (!payload) return;
   if (payload.stage === 'downloading') {
     diarStatus.textContent = `Downloading speaker model… ${payload.percent}% (${payload.part}/${payload.total})`;
+  } else if (payload.stage === 'reconstructing') {
+    diarStatus.textContent = 'Reassembling speaker model from downloaded parts…';
+  } else if (payload.stage === 'verifying') {
+    diarStatus.textContent = 'Verifying speaker model integrity…';
   } else if (payload.stage === 'caching') {
     diarStatus.textContent = 'Caching speaker model in this browser…';
   } else {
@@ -1067,7 +1071,7 @@ function onDiarizationMessage(e){
     diarStatus.textContent = `Done — found ${speakerCount} speaker${speakerCount === 1 ? '' : 's'}.`;
     btnAnalyzeSpeakers.disabled = false;
   } else if (type === 'error') {
-    diarStatus.textContent = 'Speaker analysis failed — see console.';
+    diarStatus.textContent = `Speaker analysis failed: ${payload}`;
     console.error('diarization error:', payload);
     btnAnalyzeSpeakers.disabled = false;
   }
