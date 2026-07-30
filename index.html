@@ -203,6 +203,10 @@
   .transcript-row{display:flex;gap:12px;margin-bottom:10px;}
   .paragraph{margin-bottom:6px;padding-top:12px;border-top:1px dashed var(--line-soft);}
   .paragraph:first-child{border-top:none;padding-top:0;}
+  .speaker-label{
+    font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--phosphor);margin-bottom:5px;
+  }
   .ts{color:var(--phosphor-dim);flex-shrink:0;user-select:none;}
   .txt{color:var(--text);}
   .empty-state{
@@ -290,6 +294,16 @@
       </div>
 
       <div class="rail-group">
+        <h3>Paragraph grouping</h3>
+        <select id="diarizationMode" class="lang-select">
+          <option value="pause">Pause heuristic (live)</option>
+          <option value="speaker">Speaker segmentation (beta)</option>
+        </select>
+        <div class="meta-line" id="diarStatus" style="border:none;color:var(--text-dim);font-size:10.5px;line-height:1.6;padding-top:6px;"></div>
+        <button class="btn" id="btnAnalyzeSpeakers" style="display:none;margin-top:2px;">Analyze speakers</button>
+      </div>
+
+      <div class="rail-group">
         <h3>Model</h3>
         <div class="meta-line"><span>ID</span><b id="metaModelId">—</b></div>
         <div class="meta-line"><span>Backend</span><b id="metaBackend">—</b></div>
@@ -365,9 +379,18 @@ const PARAGRAPH_BREAK_MS = 1400;       // longer pause -> likely a turn change, 
 const MIN_CHUNK_SECONDS = 1.0;         // don't flush slivers shorter than this
 const MAX_CHUNK_SECONDS = 10;          // hard cap if no pause ever comes
 
-const pendingChunks = new Map(); // id -> { ts, newParagraph }
-const transcriptRows = [];       // {ts, text, newParagraph}
+const pendingChunks = new Map(); // id -> { ts, tsSeconds, newParagraph }
+const transcriptRows = [];       // {ts, tsSeconds, text, newParagraph, speaker}
 let currentParagraphEl = null;
+
+// Real speaker segmentation (opt-in, "beta" mode) — runs once, after
+// recording stops, over the whole session's audio. Unlike the pause
+// heuristic this needs a full pass to cluster speakers consistently, so
+// it can't run live the way transcription does.
+let diarizationWorker = null;
+let diarizationReady = false;
+let diarizationReadyResolvers = [];
+const sessionAudioForDiarization = []; // Float32Array chunks @16kHz, only kept in "speaker" mode
 
 // ---------------------------------------------------------------
 // DOM refs
@@ -380,7 +403,7 @@ const metaModelId = el('metaModelId'), metaBackend = el('metaBackend'), metaStat
 const modelProgress = el('modelProgress');
 const scopeTime = el('scopeTime');
 const transcriptLog = el('transcriptLog');
-const emptyState = el('emptyState');
+let emptyState = el('emptyState');
 const summaryDrawer = el('summaryDrawer');
 const btnInstall = el('btnInstall'), pwaInstalledBox = el('pwaInstalledBox');
 const pwaFallback = el('pwaFallback'), btnUninstallHelp = el('btnUninstallHelp');
@@ -408,6 +431,8 @@ if (!supportsTabAudio) {
 }
 const btnSummarize = el('btnSummarize'), btnExport = el('btnExport'), btnClear = el('btnClear');
 const langSelect = el('langSelect');
+const diarizationModeSelect = el('diarizationMode'), diarStatus = el('diarStatus');
+const btnAnalyzeSpeakers = el('btnAnalyzeSpeakers');
 const metaCache = el('metaCache'), metaPersist = el('metaPersist');
 
 // ---------------------------------------------------------------
@@ -691,6 +716,8 @@ async function startCapture(kind){
   bufferedSamples = 0;
   hadSpeechInChunk = false;
   silenceStartTs = null;
+  sessionAudioForDiarization.length = 0;
+  btnAnalyzeSpeakers.style.display = 'none';
 
   dotRec.className = 'dot rec';
   lblRec.textContent = 'Recording';
@@ -721,6 +748,11 @@ function stopCapture(){
   btnTab.disabled = false;
   btnMic.disabled = false;
   btnStop.disabled = true;
+
+  if (diarizationModeIsSpeaker() && sessionAudioForDiarization.length) {
+    btnAnalyzeSpeakers.style.display = 'block';
+    btnAnalyzeSpeakers.disabled = false;
+  }
 }
 
 btnTab.addEventListener('click', () => startCapture('tab'));
@@ -780,7 +812,8 @@ function flushBuffer(reason = 'manual', pauseMs = 0){
   }
 
   const merged = mergeBuffers(pcmBuffer, bufferedSamples);
-  const startLabel = formatTime(chunkStartSample / bufferSampleRate);
+  const startSeconds = chunkStartSample / bufferSampleRate;
+  const startLabel = formatTime(startSeconds);
   chunkStartSample = sessionSamples;
   pcmBuffer = [];
   bufferedSamples = 0;
@@ -792,8 +825,16 @@ function flushBuffer(reason = 'manual', pauseMs = 0){
   const newParagraph = reason === 'pause' && pauseMs >= PARAGRAPH_BREAK_MS;
 
   const resampled = resampleTo16k(merged, bufferSampleRate);
+
+  if (diarizationModeIsSpeaker()) {
+    // .slice() makes a real copy — resampled.buffer is about to be
+    // transferred (zero-copy) to the Whisper worker below, which would
+    // otherwise detach it and leave nothing here to accumulate.
+    sessionAudioForDiarization.push(resampled.slice());
+  }
+
   const id = 'c' + Math.random().toString(36).slice(2);
-  pendingChunks.set(id, { ts: startLabel, newParagraph });
+  pendingChunks.set(id, { ts: startLabel, tsSeconds: startSeconds, newParagraph });
 
   worker.postMessage(
     { type: 'transcribe', payload: { audio: resampled, id, language: langSelect.value } },
@@ -802,18 +843,24 @@ function flushBuffer(reason = 'manual', pauseMs = 0){
 }
 
 function onTranscriptResult({ id, text }){
-  const meta = pendingChunks.get(id) || { ts: '00:00', newParagraph: false };
+  const meta = pendingChunks.get(id) || { ts: '00:00', tsSeconds: 0, newParagraph: false };
   pendingChunks.delete(id);
   if (!text) return;
-  transcriptRows.push({ ts: meta.ts, text, newParagraph: meta.newParagraph });
+  transcriptRows.push({ ts: meta.ts, tsSeconds: meta.tsSeconds, text, newParagraph: meta.newParagraph, speaker: null });
   renderTranscriptRow(meta.ts, text, meta.newParagraph);
 }
 
-function renderTranscriptRow(ts, text, newParagraph){
+function renderTranscriptRow(ts, text, newParagraph, speaker){
   if (emptyState) { emptyState.remove(); emptyState = null; }
   if (!currentParagraphEl || newParagraph) {
     currentParagraphEl = document.createElement('div');
     currentParagraphEl.className = 'paragraph';
+    if (speaker !== undefined && speaker !== null) {
+      const label = document.createElement('div');
+      label.className = 'speaker-label';
+      label.textContent = `Speaker ${speaker + 1}`;
+      currentParagraphEl.appendChild(label);
+    }
     transcriptLog.appendChild(currentParagraphEl);
   }
   const row = document.createElement('div');
@@ -896,9 +943,14 @@ drawScope();
 // export
 // ---------------------------------------------------------------
 function getFullTranscript(){
+  let lastSpeaker;
   return transcriptRows.map((r, i) => {
-    const sep = i === 0 ? '' : (r.newParagraph ? '\n\n' : '\n');
-    return `${sep}**[${r.ts}]** ${r.text}`;
+    const speakerChanged = r.speaker != null && r.speaker !== lastSpeaker;
+    lastSpeaker = r.speaker;
+    const speakerHeader = speakerChanged ? `**Speaker ${r.speaker + 1}**\n\n` : '';
+    if (i === 0) return `${speakerHeader}**[${r.ts}]** ${r.text}`;
+    const sep = r.newParagraph ? '\n\n' : '\n';
+    return `${sep}${speakerHeader}**[${r.ts}]** ${r.text}`;
   }).join('');
 }
 
@@ -917,6 +969,11 @@ btnClear.addEventListener('click', () => {
   transcriptRows.length = 0;
   transcriptLog.innerHTML = '';
   currentParagraphEl = null;
+  sessionAudioForDiarization.length = 0;
+  btnAnalyzeSpeakers.style.display = 'none';
+  diarStatus.textContent = diarizationModeIsSpeaker()
+    ? 'Computed once after you stop recording. First use downloads a one-time ~54MB local model.'
+    : '';
   summaryDrawer.classList.add('hidden');
   summaryDrawer.textContent = '';
 });
@@ -958,6 +1015,106 @@ btnSummarize.addEventListener('click', async () => {
     btnSummarize.disabled = false;
   }
 });
+
+// ---------------------------------------------------------------
+// speaker segmentation (beta) — real voice-based diarization, run
+// on demand via k2-fsa/sherpa-onnx compiled to WebAssembly. Unlike the
+// pause heuristic, this needs one full pass over the whole recording to
+// cluster speakers consistently, so it's a deliberate "Analyze speakers"
+// action after stopping rather than something that updates live.
+// ---------------------------------------------------------------
+function diarizationModeIsSpeaker(){
+  return diarizationModeSelect.value === 'speaker';
+}
+
+diarizationModeSelect.addEventListener('change', () => {
+  if (diarizationModeIsSpeaker()) {
+    diarStatus.textContent = 'Computed once after you stop recording. First use downloads a one-time ~54MB local model.';
+  } else {
+    diarStatus.textContent = '';
+  }
+  btnAnalyzeSpeakers.style.display =
+    (diarizationModeIsSpeaker() && sessionAudioForDiarization.length && !isRecording) ? 'block' : 'none';
+});
+
+function waitForDiarizationReady(){
+  if (diarizationReady) return Promise.resolve();
+  return new Promise((resolve) => diarizationReadyResolvers.push(resolve));
+}
+
+function onDiarizationMessage(e){
+  const { type, payload } = e.data;
+  if (type === 'ready') {
+    diarizationReady = true;
+    diarizationReadyResolvers.forEach((r) => r());
+    diarizationReadyResolvers = [];
+  } else if (type === 'result') {
+    applyDiarizationResult(payload.segments);
+    const speakerCount = new Set(payload.segments.map((s) => s.speaker)).size;
+    diarStatus.textContent = `Done — found ${speakerCount} speaker${speakerCount === 1 ? '' : 's'}.`;
+    btnAnalyzeSpeakers.disabled = false;
+  } else if (type === 'error') {
+    diarStatus.textContent = 'Speaker analysis failed — see console.';
+    console.error('diarization error:', payload);
+    btnAnalyzeSpeakers.disabled = false;
+  }
+}
+
+function applyDiarizationResult(segments){
+  if (!segments || !segments.length) return;
+  const sorted = segments.slice().sort((a, b) => a.start - b.start);
+
+  transcriptRows.forEach((row) => {
+    let match = sorted.find((s) => row.tsSeconds >= s.start && row.tsSeconds < s.end);
+    if (!match) {
+      match = sorted.reduce((best, s) =>
+        Math.abs(s.start - row.tsSeconds) < Math.abs(best.start - row.tsSeconds) ? s : best, sorted[0]);
+    }
+    row.speaker = match.speaker;
+  });
+
+  // re-render grouped by actual speaker turns instead of pause gaps
+  transcriptLog.innerHTML = '';
+  currentParagraphEl = null;
+  let lastSpeaker = null;
+  transcriptRows.forEach((row) => {
+    const newP = row.speaker !== lastSpeaker;
+    lastSpeaker = row.speaker;
+    renderTranscriptRow(row.ts, row.text, newP, row.speaker);
+  });
+}
+
+btnAnalyzeSpeakers.addEventListener('click', async () => {
+  if (!sessionAudioForDiarization.length) { alert('No recorded audio to analyze yet.'); return; }
+
+  btnAnalyzeSpeakers.disabled = true;
+
+  if (!diarizationWorker) {
+    diarStatus.textContent = 'Loading speaker model… (first time only, ~54MB, then cached)';
+    diarizationWorker = new Worker('./diarization-worker.js');
+    diarizationWorker.onmessage = onDiarizationMessage;
+    diarizationWorker.onerror = (e) => {
+      diarStatus.textContent = 'Speaker model failed to load — see console. Make sure the sherpa-onnx-*.js/.wasm/.data files are next to index.html.';
+      console.error('diarization worker error:', e);
+      btnAnalyzeSpeakers.disabled = false;
+    };
+  }
+
+  try {
+    await waitForDiarizationReady();
+  } catch {
+    return; // error already reported via onerror above
+  }
+
+  diarStatus.textContent = 'Analyzing speakers… this can take a while for longer recordings.';
+  const totalSamples = sessionAudioForDiarization.reduce((sum, c) => sum + c.length, 0);
+  const merged = mergeBuffers(sessionAudioForDiarization, totalSamples);
+  diarizationWorker.postMessage(
+    { type: 'diarize', payload: { audio: merged, numClusters: -1, threshold: 0.5 } },
+    [merged.buffer]
+  );
+});
+
 </script>
 </body>
 </html>
