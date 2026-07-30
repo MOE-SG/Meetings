@@ -1042,9 +1042,22 @@ function waitForDiarizationReady(){
   return new Promise((resolve) => diarizationReadyResolvers.push(resolve));
 }
 
+function onDiarizationProgress(payload){
+  if (!payload) return;
+  if (payload.stage === 'downloading') {
+    diarStatus.textContent = `Downloading speaker model… ${payload.percent}% (${payload.part}/${payload.total})`;
+  } else if (payload.stage === 'caching') {
+    diarStatus.textContent = 'Caching speaker model in this browser…';
+  } else {
+    diarStatus.textContent = 'Loading speaker model…';
+  }
+}
+
 function onDiarizationMessage(e){
   const { type, payload } = e.data;
-  if (type === 'ready') {
+  if (type === 'progress') {
+    onDiarizationProgress(payload);
+  } else if (type === 'ready') {
     diarizationReady = true;
     diarizationReadyResolvers.forEach((r) => r());
     diarizationReadyResolvers = [];
@@ -1094,7 +1107,7 @@ btnAnalyzeSpeakers.addEventListener('click', async () => {
     diarizationWorker = new Worker('./diarization-worker.js');
     diarizationWorker.onmessage = onDiarizationMessage;
     diarizationWorker.onerror = (e) => {
-      diarStatus.textContent = 'Speaker model failed to load — see console. Make sure the sherpa-onnx-*.js/.wasm/.data files are next to index.html.';
+      diarStatus.textContent = 'Speaker model failed to load — see console. The app tried to download the speaker-model data from GitHub release assets; check the network and asset availability.';
       console.error('diarization worker error:', e);
       btnAnalyzeSpeakers.disabled = false;
     };
