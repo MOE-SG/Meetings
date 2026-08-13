@@ -980,7 +980,57 @@ btnClear.addEventListener('click', () => {
 
 // ---------------------------------------------------------------
 // local LLM summarization (WebLLM, lazy-loaded, WebGPU only)
+//
+// The prebuilt WebLLM WASM library for this model has its context window
+// FIXED AT COMPILE TIME to 4096 tokens — this isn't a runtime setting we
+// can just raise (see https://github.com/mlc-ai/web-llm/issues/752), so
+// long transcripts have to be chunked to fit rather than sent in one go.
 // ---------------------------------------------------------------
+const MODEL_CONTEXT_WINDOW_TOKENS = 4096;      // hard ceiling baked into the compiled WASM
+const RESERVED_FOR_PROMPT_AND_OUTPUT = 700;    // headroom for system prompt + generated reply
+const CHARS_PER_TOKEN_ESTIMATE = 3.5;          // conservative (no tokenizer on hand client-side; multilingual text often runs fewer chars/token than English)
+const SAFE_INPUT_TOKEN_BUDGET = MODEL_CONTEXT_WINDOW_TOKENS - RESERVED_FOR_PROMPT_AND_OUTPUT;
+const SAFE_INPUT_CHAR_BUDGET = Math.floor(SAFE_INPUT_TOKEN_BUDGET * CHARS_PER_TOKEN_ESTIMATE);
+
+function estimateTokenCount(text){
+  return Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE);
+}
+
+// Packs whole paragraphs (already reflecting pause/speaker breaks) into
+// chunks under the safe character budget, splitting only if a single
+// paragraph is itself unusually long.
+function chunkTranscriptForSummarization(){
+  const paragraphs = [];
+  let current = [];
+  transcriptRows.forEach((row, i) => {
+    if (i > 0 && row.newParagraph) {
+      paragraphs.push(current);
+      current = [];
+    }
+    current.push(row);
+  });
+  if (current.length) paragraphs.push(current);
+
+  const paragraphTexts = paragraphs.map((rows) => rows.map((r) => r.text).join(' '));
+
+  const chunks = [];
+  let buffer = '';
+  for (const p of paragraphTexts) {
+    if (buffer && buffer.length + p.length + 2 > SAFE_INPUT_CHAR_BUDGET) {
+      chunks.push(buffer);
+      buffer = p;
+    } else {
+      buffer = buffer ? buffer + '\n\n' + p : p;
+    }
+    while (buffer.length > SAFE_INPUT_CHAR_BUDGET) {
+      chunks.push(buffer.slice(0, SAFE_INPUT_CHAR_BUDGET));
+      buffer = buffer.slice(SAFE_INPUT_CHAR_BUDGET);
+    }
+  }
+  if (buffer) chunks.push(buffer);
+  return chunks;
+}
+
 btnSummarize.addEventListener('click', async () => {
   if (!hasWebGPU) { alert('Summarization needs WebGPU, which this browser does not expose.'); return; }
   if (!transcriptRows.length) { alert('Nothing transcribed yet.'); return; }
@@ -997,14 +1047,40 @@ btnSummarize.addEventListener('click', async () => {
       });
     }
 
-    summaryDrawer.textContent = 'Summarizing…';
+    const fullText = getFullTranscript();
+    let sourceText;
+
+    if (estimateTokenCount(fullText) <= SAFE_INPUT_TOKEN_BUDGET) {
+      sourceText = fullText;
+    } else {
+      // Too long for one pass: summarize chunk by chunk, then combine
+      // those (much shorter) chunk summaries into the final result.
+      const chunks = chunkTranscriptForSummarization();
+      const chunkSummaries = [];
+      for (let i = 0; i < chunks.length; i++) {
+        summaryDrawer.textContent = `Summarizing part ${i + 1} of ${chunks.length}…`;
+        const partReply = await mlcEngine.chat.completions.create({
+          messages: [
+            {
+              role: 'system',
+              content: 'Condense this excerpt from a longer meeting transcript into brief factual notes, a few sentences. Only use information present in the excerpt. No preamble.'
+            },
+            { role: 'user', content: chunks[i] }
+          ]
+        });
+        chunkSummaries.push(partReply.choices[0].message.content.trim());
+      }
+      sourceText = chunkSummaries.map((s, i) => `Part ${i + 1} notes:\n${s}`).join('\n\n');
+      summaryDrawer.textContent = 'Combining into a final summary…';
+    }
+
     const reply = await mlcEngine.chat.completions.create({
       messages: [
         {
           role: 'system',
           content: 'You summarize meeting transcripts. Reply with a short "Summary" paragraph followed by an "Action items" bullet list. Only use information present in the transcript.'
         },
-        { role: 'user', content: getFullTranscript() }
+        { role: 'user', content: sourceText }
       ]
     });
     summaryDrawer.textContent = reply.choices[0].message.content;
