@@ -304,6 +304,24 @@
       </div>
 
       <div class="rail-group">
+        <h3>Model source (offline-first)</h3>
+        <button class="btn" id="btnPickFolder">📁 Pick local model folder…</button>
+        <div class="meta-line" id="folderStatus" style="border:none;color:var(--text-dim);font-size:10.5px;line-height:1.6;padding-top:4px;">Checking…</div>
+        <button class="btn stop" id="btnForgetFolder" style="display:none;margin-top:4px;">Forget folder</button>
+
+        <div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--line-soft);">
+          <div class="meta-line" style="border:none;color:var(--text-dim);font-size:10.5px;padding-bottom:6px;">Internal mirror URL (optional)</div>
+          <input type="text" id="internalUrlInput" placeholder="http://intranet-host/models" class="lang-select" style="margin-bottom:6px;">
+          <button class="btn" id="btnSaveInternalUrl">Save</button>
+          <div class="meta-line" id="internalUrlStatus" style="border:none;color:var(--text-dim);font-size:10.5px;line-height:1.6;padding-top:4px;"></div>
+        </div>
+
+        <div class="meta-line" style="border:none;color:var(--text-dim);font-size:10px;line-height:1.6;padding-top:10px;">
+          Order tried: local folder → internal URL → Hugging Face. Folder picking only works for transcription (Chrome/Edge); the internal URL applies to both transcription and summarization. Changes take effect after reloading.
+        </div>
+      </div>
+
+      <div class="rail-group">
         <h3>Model</h3>
         <div class="meta-line"><span>ID</span><b id="metaModelId">—</b></div>
         <div class="meta-line"><span>Backend</span><b id="metaBackend">—</b></div>
@@ -431,6 +449,9 @@ if (!supportsTabAudio) {
 }
 const btnSummarize = el('btnSummarize'), btnExport = el('btnExport'), btnClear = el('btnClear');
 const langSelect = el('langSelect');
+const btnPickFolder = el('btnPickFolder'), folderStatus = el('folderStatus'), btnForgetFolder = el('btnForgetFolder');
+const internalUrlInput = el('internalUrlInput'), btnSaveInternalUrl = el('btnSaveInternalUrl'), internalUrlStatus = el('internalUrlStatus');
+let currentDirHandle = null;
 const diarizationModeSelect = el('diarizationMode'), diarStatus = el('diarStatus');
 const btnAnalyzeSpeakers = el('btnAnalyzeSpeakers');
 const metaCache = el('metaCache'), metaPersist = el('metaPersist');
@@ -546,10 +567,79 @@ import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transfo
 env.allowLocalModels = false;
 
 let transcriber = null;
+let localDirHandle = null;
+let internalServerUrl = null;
+
+// Maps a normal Hugging Face resolve URL to a relative path like
+// "Xenova/whisper-small/onnx/encoder_model.onnx", used both to look up
+// the file in a picked local folder and to build the internal-mirror URL.
+// Plain string parsing on purpose (no regex) to keep this simple to
+// verify correct: "https://huggingface.co/{repo}/resolve/{rev}/{file}".
+function hfUrlToRelativePath(url){
+  const schemeEnd = url.indexOf('://');
+  if (schemeEnd === -1) return null;
+  const afterScheme = url.slice(schemeEnd + 3);
+  const firstSlash = afterScheme.indexOf('/');
+  if (firstSlash === -1) return null;
+  const pathPart = afterScheme.slice(firstSlash + 1);
+
+  const marker = '/resolve/';
+  const resolveIdx = pathPart.indexOf(marker);
+  if (resolveIdx === -1) return null;
+  const repoPath = pathPart.slice(0, resolveIdx);
+
+  const afterResolve = pathPart.slice(resolveIdx + marker.length);
+  const nextSlash = afterResolve.indexOf('/');
+  if (nextSlash === -1) return null;
+  const filePath = afterResolve.slice(nextSlash + 1);
+
+  return repoPath + '/' + filePath;
+}
+
+async function getFileFromDirHandle(root, relPath){
+  const parts = relPath.split('/').filter(Boolean);
+  let dir = root;
+  for (let i = 0; i < parts.length - 1; i++) {
+    dir = await dir.getDirectoryHandle(parts[i]);
+  }
+  const fileHandle = await dir.getFileHandle(parts[parts.length - 1]);
+  return await fileHandle.getFile();
+}
+
+// Tries, in order: picked local folder -> internal mirror URL -> the
+// real network request (Hugging Face by default). Each step falls
+// through quietly on failure rather than surfacing an error, since a
+// missing file locally/on the mirror is an expected, normal case.
+env.fetch = async (resource, init) => {
+  const url = typeof resource === 'string' ? resource : resource.url;
+  const relPath = hfUrlToRelativePath(url);
+
+  if (relPath && localDirHandle) {
+    try {
+      const file = await getFileFromDirHandle(localDirHandle, relPath);
+      return new Response(file, { status: 200 });
+    } catch (e) { /* not present locally — fall through */ }
+  }
+
+  if (relPath && internalServerUrl) {
+    try {
+      let base = internalServerUrl;
+      while (base.endsWith('/')) base = base.slice(0, -1);
+      const mirrored = base + '/' + relPath;
+      const resp = await fetch(mirrored);
+      if (resp.ok) return resp;
+    } catch (e) { /* mirror unreachable — fall through */ }
+  }
+
+  return fetch(resource, init);
+};
 
 self.onmessage = async (e) => {
   const { type, payload } = e.data;
-  if (type === 'init') {
+  if (type === 'configure-model-source') {
+    localDirHandle = payload.dirHandle || null;
+    internalServerUrl = payload.internalServerUrl || null;
+  } else if (type === 'init') {
     const { modelId, device } = payload;
     try {
       transcriber = await pipeline('automatic-speech-recognition', modelId, {
@@ -608,8 +698,121 @@ function onWorkerError(msg){
 }
 
 // ---------------------------------------------------------------
-// capability detection + model bootstrap
+// offline-first model source: local picked folder (File System Access
+// API — Chrome/Edge only, and only usable for Whisper since transformers.js
+// exposes a fetch hook and WebLLM doesn't) and/or an internal http(s)
+// mirror URL (works for both models — just a URL substitution, no special
+// browser API needed). Falls through to Hugging Face if neither has the
+// file, tried in that order.
 // ---------------------------------------------------------------
+const FOLDER_DB_NAME = 'meeting-scope-folder-handle';
+const FOLDER_STORE = 'handles';
+const FOLDER_KEY = 'whisper-model-folder';
+const INTERNAL_URL_STORAGE_KEY = 'meeting-scope-internal-model-url';
+
+function openFolderDb(){
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(FOLDER_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(FOLDER_STORE)) db.createObjectStore(FOLDER_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveFolderHandle(handle){
+  const db = await openFolderDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(FOLDER_STORE, 'readwrite');
+    if (handle) tx.objectStore(FOLDER_STORE).put(handle, FOLDER_KEY);
+    else tx.objectStore(FOLDER_STORE).delete(FOLDER_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadFolderHandle(){
+  const db = await openFolderDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(FOLDER_STORE, 'readonly');
+    const req = tx.objectStore(FOLDER_STORE).get(FOLDER_KEY);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function refreshFolderUI(permissionNote){
+  if (permissionNote) {
+    folderStatus.textContent = permissionNote;
+  } else if (currentDirHandle) {
+    folderStatus.textContent = `Using folder: "${currentDirHandle.name}"`;
+  } else {
+    folderStatus.textContent = 'No folder selected — falls through to internal URL / Hugging Face.';
+  }
+  btnForgetFolder.style.display = currentDirHandle ? 'block' : 'none';
+}
+
+btnPickFolder.addEventListener('click', async () => {
+  if (!('showDirectoryPicker' in window)) {
+    alert('This browser can\'t pick local folders (needs Chrome or Edge).');
+    return;
+  }
+  try {
+    const handle = await window.showDirectoryPicker();
+    currentDirHandle = handle;
+    await saveFolderHandle(handle);
+    refreshFolderUI();
+    worker.postMessage({
+      type: 'configure-model-source',
+      payload: { dirHandle: currentDirHandle, internalServerUrl: internalUrlInput.value.trim() || null },
+    });
+    alert('Folder saved. Reload the page to use it for the next model load.');
+  } catch (e) {
+    if (e.name !== 'AbortError') console.error(e);
+  }
+});
+
+btnForgetFolder.addEventListener('click', async () => {
+  currentDirHandle = null;
+  await saveFolderHandle(null);
+  refreshFolderUI();
+});
+
+btnSaveInternalUrl.addEventListener('click', () => {
+  const url = internalUrlInput.value.trim();
+  localStorage.setItem(INTERNAL_URL_STORAGE_KEY, url);
+  worker.postMessage({
+    type: 'configure-model-source',
+    payload: { dirHandle: currentDirHandle, internalServerUrl: url || null },
+  });
+  internalUrlStatus.textContent = url ? `Saved. Reload to use it for the next model load.` : 'Cleared.';
+});
+
+async function restoreModelSourceSettings(){
+  const savedUrl = localStorage.getItem(INTERNAL_URL_STORAGE_KEY) || '';
+  internalUrlInput.value = savedUrl;
+
+  try {
+    const handle = await loadFolderHandle();
+    if (handle) {
+      const perm = await handle.queryPermission({ mode: 'read' });
+      if (perm === 'granted') {
+        currentDirHandle = handle;
+      } else {
+        refreshFolderUI('Folder saved but needs re-permission — click "Pick local model folder" again.');
+        return { dirHandle: null, internalServerUrl: savedUrl || null };
+      }
+    }
+  } catch (e) {
+    console.warn('Could not restore saved model folder:', e);
+  }
+  refreshFolderUI();
+  return { dirHandle: currentDirHandle, internalServerUrl: savedUrl || null };
+}
+
+
 async function detectWebGPU(){
   if (!('gpu' in navigator)) return false;
   try {
@@ -624,6 +827,9 @@ async function boot(){
   hasWebGPU = await detectWebGPU();
   dotGpu.className = 'dot ' + (hasWebGPU ? 'on' : 'off');
   lblGpu.textContent = 'WebGPU: ' + (hasWebGPU ? 'available' : 'unavailable');
+
+  const modelSource = await restoreModelSourceSettings();
+  worker.postMessage({ type: 'configure-model-source', payload: modelSource });
 
   const modelId = hasWebGPU ? 'Xenova/whisper-small' : 'Xenova/whisper-base';
   const device = hasWebGPU ? 'webgpu' : 'wasm';
@@ -1041,10 +1247,42 @@ btnSummarize.addEventListener('click', async () => {
 
   try {
     if (!mlcEngine) {
-      const { CreateMLCEngine } = await import('https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.84/lib/index.js');
-      mlcEngine = await CreateMLCEngine('Qwen2.5-1.5B-Instruct-q4f16_1-MLC', {
-        initProgressCallback: (p) => { summaryDrawer.textContent = p.text || 'loading…'; }
-      });
+      const { CreateMLCEngine, prebuiltAppConfig } = await import('https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.84/lib/index.js');
+      // Small enough (~150-250MB total, individual shards ~33MB) to commit
+      // straight into this repo if Hugging Face is blocked on your network —
+      // see the "Model source" panel's internal-mirror URL field, pointed
+      // at this same site, to serve it same-origin instead.
+      const modelId = 'SmolLM2-360M-Instruct-q4f16_1-MLC';
+      const progressCb = (p) => { summaryDrawer.textContent = p.text || 'loading…'; };
+
+      // WebLLM has no fetch-override hook like transformers.js does, so the
+      // only fallback we can offer it is an internal mirror URL (same idea
+      // as env.remoteHost) — not the local-folder picker, which needs that
+      // lower-level hook. Substitute the model weight URL's host if a
+      // mirror is configured, and fall back to Hugging Face if it fails.
+      const savedInternalUrl = (localStorage.getItem(INTERNAL_URL_STORAGE_KEY) || '').trim();
+      let appConfigOverride;
+      if (savedInternalUrl) {
+        const baseEntry = prebuiltAppConfig.model_list.find((m) => m.model_id === modelId);
+        if (baseEntry) {
+          let base = savedInternalUrl;
+          while (base.endsWith('/')) base = base.slice(0, -1);
+          const mirroredModel = baseEntry.model.replace('https://huggingface.co', base);
+          appConfigOverride = { model_list: [{ ...baseEntry, model: mirroredModel }] };
+        }
+      }
+
+      try {
+        mlcEngine = await CreateMLCEngine(modelId, { appConfig: appConfigOverride, initProgressCallback: progressCb });
+      } catch (mirrorErr) {
+        if (appConfigOverride) {
+          console.warn('Internal mirror failed for summarization model, falling back to Hugging Face:', mirrorErr);
+          summaryDrawer.textContent = 'Internal mirror unavailable — falling back to Hugging Face…';
+          mlcEngine = await CreateMLCEngine(modelId, { initProgressCallback: progressCb });
+        } else {
+          throw mirrorErr;
+        }
+      }
     }
 
     const fullText = getFullTranscript();
