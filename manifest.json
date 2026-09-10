@@ -1,6 +1,6 @@
 {
-  "name": "SOE Meetings — local transcription",
-  "short_name": "Meeting Scope",
+  "name": "SOE Meeting — local transcription",
+  "short_name": "SOE Meeting",
   "description": "Fully in-browser meeting transcription, nothing leaves the device.",
   "start_url": "./",
   "scope": "./",

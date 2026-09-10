@@ -7,11 +7,11 @@
 <meta name="theme-color" content="#0a0f0d">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="SOE Meetings">
+<meta name="apple-mobile-web-app-title" content="SOE Meeting">
 <link rel="manifest" href="./manifest.json">
 <link rel="icon" href="./icon-192.png">
 <link rel="apple-touch-icon" href="./icon-192.png">
-<title>SOE Meetings — local transcription</title>
+<title>SOE Meeting — local transcription</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
 
@@ -243,7 +243,7 @@
   <header class="bar">
     <div class="brand">
       <div class="eyebrow">local asr // nothing leaves the browser</div>
-      <h1>MEETING <span>SCOPE</span></h1>
+      <h1>SOE <span>MEETING</span></h1>
     </div>
     <div class="pills">
       <div class="pill"><span class="dot off" id="dotGpu"></span><span id="lblGpu">WebGPU: checking</span></div>
@@ -644,6 +644,12 @@ self.onmessage = async (e) => {
     try {
       transcriber = await pipeline('automatic-speech-recognition', modelId, {
         device,
+        // Explicitly quantized on both devices — WebGPU otherwise defaults
+        // to fp32, which is 3-4x larger and impractical to self-host (the
+        // fp32 decoder alone exceeds GitHub's 100MB per-file limit even for
+        // whisper-small). This also means only one set of weight files is
+        // needed locally/on a mirror, not separate fp32 + q8 copies.
+        dtype: 'q8',
         progress_callback: (p) => self.postMessage({ type: 'progress', payload: p })
       });
       self.postMessage({ type: 'ready' });
@@ -831,7 +837,13 @@ async function boot(){
   const modelSource = await restoreModelSourceSettings();
   worker.postMessage({ type: 'configure-model-source', payload: modelSource });
 
-  const modelId = hasWebGPU ? 'Xenova/whisper-small' : 'Xenova/whisper-base';
+  // whisper-tiny, quantized, on both devices — the only Whisper size whose
+  // ONNX files fit under GitHub's 100MB per-file limit for self-hosting.
+  // Lower accuracy than small/base, traded deliberately for the ability to
+  // self-host when Hugging Face is blocked. Same model on both devices now
+  // that dtype is forced to 'q8' everywhere (see the worker init handler),
+  // so only one set of weight files is needed at all.
+  const modelId = 'Xenova/whisper-tiny';
   const device = hasWebGPU ? 'webgpu' : 'wasm';
   metaModelId.textContent = modelId;
   metaBackend.textContent = device;
