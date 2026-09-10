@@ -322,6 +322,18 @@
       </div>
 
       <div class="rail-group">
+        <h3>Model size</h3>
+        <select id="modelSizeSelect" class="lang-select">
+          <option value="whisper-tiny">tiny — self-hosted on GitHub (default)</option>
+          <option value="whisper-base">base — better accuracy, needs local folder or internal mirror</option>
+          <option value="whisper-small">small — best accuracy, needs local folder or internal mirror</option>
+        </select>
+        <div class="meta-line" style="border:none;color:var(--text-dim);font-size:10px;line-height:1.6;padding-top:6px;">
+          base/small are too large for the GitHub self-host path (100MB file limit) — pick these only if your local folder or internal mirror actually has them. Takes effect after reload.
+        </div>
+      </div>
+
+      <div class="rail-group">
         <h3>Model</h3>
         <div class="meta-line"><span>ID</span><b id="metaModelId">—</b></div>
         <div class="meta-line"><span>Backend</span><b id="metaBackend">—</b></div>
@@ -449,6 +461,7 @@ if (!supportsTabAudio) {
 }
 const btnSummarize = el('btnSummarize'), btnExport = el('btnExport'), btnClear = el('btnClear');
 const langSelect = el('langSelect');
+const modelSizeSelect = el('modelSizeSelect');
 const btnPickFolder = el('btnPickFolder'), folderStatus = el('folderStatus'), btnForgetFolder = el('btnForgetFolder');
 const internalUrlInput = el('internalUrlInput'), btnSaveInternalUrl = el('btnSaveInternalUrl'), internalUrlStatus = el('internalUrlStatus');
 let currentDirHandle = null;
@@ -715,6 +728,12 @@ const FOLDER_DB_NAME = 'meeting-scope-folder-handle';
 const FOLDER_STORE = 'handles';
 const FOLDER_KEY = 'whisper-model-folder';
 const INTERNAL_URL_STORAGE_KEY = 'meeting-scope-internal-model-url';
+const MODEL_SIZE_STORAGE_KEY = 'meeting-scope-model-size';
+
+modelSizeSelect.addEventListener('change', () => {
+  localStorage.setItem(MODEL_SIZE_STORAGE_KEY, modelSizeSelect.value);
+  alert('Saved. Reload the page to load the newly selected model size.');
+});
 
 function openFolderDb(){
   return new Promise((resolve, reject) => {
@@ -837,13 +856,18 @@ async function boot(){
   const modelSource = await restoreModelSourceSettings();
   worker.postMessage({ type: 'configure-model-source', payload: modelSource });
 
-  // whisper-tiny, quantized, on both devices — the only Whisper size whose
-  // ONNX files fit under GitHub's 100MB per-file limit for self-hosting.
-  // Lower accuracy than small/base, traded deliberately for the ability to
-  // self-host when Hugging Face is blocked. Same model on both devices now
-  // that dtype is forced to 'q8' everywhere (see the worker init handler),
-  // so only one set of weight files is needed at all.
-  const modelId = 'Xenova/whisper-tiny';
+  // Default is whisper-tiny — the only Whisper size whose quantized ONNX
+  // files fit under GitHub's 100MB per-file limit for self-hosting. Larger
+  // sizes (base/small) are selectable when a local folder or internal
+  // mirror actually has them (a shared network drive has no such size
+  // limit — this restriction was specifically about the GitHub-hosted
+  // fallback, not a hard ceiling on what the app can use). Quantized
+  // (q8) is still forced on both devices regardless of size chosen — see
+  // the worker init handler — so only one weight-file set is needed per
+  // size, not separate fp32/q8 copies.
+  const savedSize = localStorage.getItem(MODEL_SIZE_STORAGE_KEY) || 'whisper-tiny';
+  modelSizeSelect.value = savedSize;
+  const modelId = 'Xenova/' + savedSize;
   const device = hasWebGPU ? 'webgpu' : 'wasm';
   metaModelId.textContent = modelId;
   metaBackend.textContent = device;
