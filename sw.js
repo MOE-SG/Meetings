@@ -1,11 +1,11 @@
-// Optional companion service worker for SOE Meeting.
+// Optional companion service worker for MOE's Meetings.
 // Only needed if you deploy index.html to a real host (GitHub Pages, etc).
 // It has nothing to do with the Whisper model weights — those are already
 // cached separately by the browser's Cache Storage via transformers.js.
 // This just lets the app shell (index.html itself) load instantly and
 // work offline after the first visit.
 
-const CACHE_NAME = 'meeting-scope-shell-v3';
+const CACHE_NAME = 'meeting-scope-shell-v4';
 const SHELL_FILES = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
